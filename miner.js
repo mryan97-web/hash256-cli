@@ -1,3 +1,4 @@
+process.exit(0)
 require("dotenv").config();
 
 const { ethers } = require("ethers");
