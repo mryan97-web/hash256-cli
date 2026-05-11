@@ -1,3 +1,7 @@
+// Dummy server biar Railway tidak SIGTERM
+const http = require('http');
+const PORT = process.env.PORT || 3000;
+http.createServer((req, res) => res.end('Mining...')).listen(PORT);
 require("dotenv").config();
 
 const { ethers } = require("ethers");
