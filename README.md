@@ -57,7 +57,7 @@ npm -v
 ## Setup Project
 
 ```bash
-git clone <URL_REPO_KAMU>
+git clone https://github.com/mrfunntastiic/hash256-cli
 cd hash256-cli
 
 npm install
