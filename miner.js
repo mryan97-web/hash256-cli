@@ -9,18 +9,14 @@ const { Worker, isMainThread, parentPort, workerData } = require("worker_threads
 // WORKER THREAD
 // ─────────────────────────────────────────────────────────────────────────────
 if (!isMainThread) {
-  // ethers di-require sekali di luar loop
-  const { keccak256, solidityPackedKeccak256 } = require("ethers");
-
+  const { solidityPackedKeccak256 } = require("ethers");
   const { challenge, difficultyHex, startNonce } = workerData;
   const diffBig = BigInt("0x" + difficultyHex);
 
   let nonce   = BigInt(startNonce);
   let counter = 0;
-  const REPORT = 5_000; // kirim update tiap 5k hash
 
   while (true) {
-    // solidityPackedKeccak256(["bytes32","uint256"], [challenge, nonce])
     const hash    = solidityPackedKeccak256(["bytes32", "uint256"], [challenge, nonce]);
     const hashBig = BigInt(hash);
     counter++;
@@ -32,8 +28,8 @@ if (!isMainThread) {
 
     nonce++;
 
-    if (counter % REPORT === 0) {
-      parentPort.postMessage({ found: false, count: REPORT });
+    if (counter % 5_000 === 0) {
+      parentPort.postMessage({ found: false, count: 5_000 });
     }
   }
   process.exit(0);
@@ -43,8 +39,9 @@ if (!isMainThread) {
 // MAIN THREAD
 // ─────────────────────────────────────────────────────────────────────────────
 
-const NUM_CORES  = os.cpus().length;
-const START_TIME = Date.now();
+// Batasi max 4 worker agar tidak OOM/crash di Railway
+const MAX_WORKERS = Math.min(os.cpus().length, 4);
+const START_TIME  = Date.now();
 let totalHashes     = 0;
 let totalFound      = 0;
 let windowHashes    = 0;
@@ -65,12 +62,12 @@ function formatHashrate(hps) {
   return hps.toFixed(0) + " H/s";
 }
 
-// Dummy HTTP server
 const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => {
   res.writeHead(200, { "Content-Type": "text/plain" });
   res.end(
-    `HASH256 Miner (${NUM_CORES} cores)\n` +
+    `HASH256 Miner\n` +
+    `Workers  : ${MAX_WORKERS}\n` +
     `Uptime   : ${formatDuration(Date.now() - START_TIME)}\n` +
     `Hashrate : ${formatHashrate(currentHashrate)}\n` +
     `Total    : ${totalHashes.toLocaleString()} hashes\n` +
@@ -80,7 +77,6 @@ http.createServer((req, res) => {
   console.log(`HTTP server listening on port ${PORT}`);
 });
 
-// Stats tiap 5 detik
 setInterval(() => {
   const now     = Date.now();
   const elapsed = (now - windowStart) / 1000;
@@ -94,7 +90,7 @@ setInterval(() => {
     `Total: ${totalHashes.toLocaleString()} | ` +
     `Found: ${totalFound} | ` +
     `Uptime: ${formatDuration(Date.now() - START_TIME)} | ` +
-    `Cores: ${NUM_CORES}`
+    `Workers: ${MAX_WORKERS}`
   );
 }, 5000);
 
@@ -104,7 +100,7 @@ const CONTRACT_ADDRESS = "0xAC7b5d06fa1e77D08aea40d46cB7C5923A87A0cc";
 
 const ABI = [
   "function getChallenge(address miner) view returns (bytes32)",
-  "function miningState() view returns (uint256 era,uint256 reward,uint256 difficulty,uint256 minted,uint256 remaining,uint256 epoch,uint256 epochBlocksLeft_)",
+  "function miningState() view returns (uint256 era,uint256 reward,uint256 difficulty,uint256 minted,uint256 remaining,uint256 epoch,uint256 epochLoadLeft_)",
   "function mine(uint256 nonce)"
 ];
 
@@ -124,7 +120,7 @@ function runWorkers(challenge, difficultyHex) {
     const workers = [];
     let resolved  = false;
 
-    for (let i = 0; i < NUM_CORES; i++) {
+    for (let i = 0; i < MAX_WORKERS; i++) {
       const startNonce = (
         BigInt(Math.floor(Math.random() * 1_000_000_000)) +
         BigInt(i) * 10_000_000_000n
@@ -165,7 +161,7 @@ async function main() {
 
   console.log(`Wallet  : ${wallet.address}`);
   console.log(`Contract: ${CONTRACT_ADDRESS}`);
-  console.log(`Cores   : ${NUM_CORES} worker threads`);
+  console.log(`Workers : ${MAX_WORKERS} threads`);
 
   while (true) {
     const state         = await contract.miningState();
@@ -180,7 +176,7 @@ async function main() {
     console.log("Epoch     :", state.epoch.toString());
     console.log("Challenge :", challenge);
     console.log("-------------------------------------------");
-    console.log(`Mining dengan ${NUM_CORES} core...`);
+    console.log(`Mining dengan ${MAX_WORKERS} worker...`);
 
     const nonceFound = await runWorkers(challenge, difficultyHex);
 
