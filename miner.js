@@ -26,7 +26,7 @@ function formatHashrate(hps) {
   return hps.toFixed(0) + " H/s";
 }
 
-// ── Dummy HTTP server biar Railway tidak SIGTERM ──────────────────────────────
+// ── Dummy HTTP server ─────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => {
   res.writeHead(200, { "Content-Type": "text/plain" });
@@ -67,26 +67,52 @@ function randomNonce() {
   return BigInt(Math.floor(Math.random() * 1_000_000_000));
 }
 
-// Print stats tiap 10 detik pakai console.log biasa
+// ── Mining dalam batch kecil agar event loop tidak terblok ───────────────────
+// Setiap BATCH_SIZE hash, yield ke event loop supaya setInterval bisa jalan
+const BATCH_SIZE = 50000;
+
+function mineOneBatch(challenge, difficulty, nonce) {
+  return new Promise((resolve) => {
+    let i = 0;
+    function step() {
+      const end = Math.min(i + BATCH_SIZE, BATCH_SIZE * 1000); // max per step
+      while (i < BATCH_SIZE) {
+        const hash    = ethers.solidityPackedKeccak256(["bytes32", "uint256"], [challenge, nonce]);
+        const hashNum = BigInt(hash);
+        totalHashes++;
+        windowHashes++;
+        i++;
+
+        if (hashNum < difficulty) {
+          return resolve({ found: true, nonce, hash });
+        }
+        nonce++;
+      }
+      // Yield ke event loop, lanjut batch berikutnya
+      resolve({ found: false, nonce });
+    }
+    setImmediate(step);
+  });
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Print stats tiap 10 detik
 function startStatsLogger() {
   setInterval(() => {
     const now     = Date.now();
     const elapsed = (now - windowStart) / 1000;
-
     if (elapsed > 0) {
       currentHashrate = windowHashes / elapsed;
       windowHashes    = 0;
       windowStart     = now;
     }
-
-    const uptime = formatDuration(now - START_TIME);
     console.log(
       `[STATS] Hashrate: ${formatHashrate(currentHashrate)} | ` +
       `Total: ${totalHashes.toLocaleString()} hashes | ` +
       `Found: ${totalFound} | ` +
-      `Uptime: ${uptime}`
+      `Uptime: ${formatDuration(Date.now() - START_TIME)}`
     );
-  }, 10000); // tiap 10 detik
+  }, 10000);
 }
 
 async function main() {
@@ -113,41 +139,32 @@ async function main() {
     console.log("Epoch     :", state.epoch.toString());
     console.log("Challenge :", challenge);
     console.log("-------------------------------------------");
-    console.log("Mining... (stats muncul tiap 10 detik)");
+    console.log("Mining...");
 
     let nonce = randomNonce();
+    let found = false;
 
-    while (true) {
-      const hash = ethers.solidityPackedKeccak256(
-        ["bytes32", "uint256"],
-        [challenge, nonce]
-      );
-
-      const hashNum = BigInt(hash);
-
-      totalHashes++;
-      windowHashes++;
-
-      if (hashNum < difficulty) {
+    while (!found) {
+      const result = await mineOneBatch(challenge, difficulty, nonce);
+      if (result.found) {
+        found = true;
         totalFound++;
-        console.log("FOUND nonce :", nonce.toString());
-        console.log("Hash        :", hash);
+        console.log("FOUND nonce :", result.nonce.toString());
+        console.log("Hash        :", result.hash);
         console.log("Total hashes:", totalHashes.toLocaleString());
         console.log("Hashrate    :", formatHashrate(currentHashrate));
 
         try {
-          const tx = await contract.mine(nonce);
+          const tx = await contract.mine(result.nonce);
           console.log("TX sent     :", tx.hash);
           const receipt = await tx.wait();
           console.log("Success block:", receipt.blockNumber);
         } catch (err) {
           console.error("TX failed   :", err.shortMessage || err.message);
         }
-
-        break;
+      } else {
+        nonce = result.nonce;
       }
-
-      nonce++;
     }
   }
 }
