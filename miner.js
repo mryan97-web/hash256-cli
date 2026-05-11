@@ -1,48 +1,39 @@
 require("dotenv").config();
 
-const { ethers }  = require("ethers");
-const http        = require("http");
-const os          = require("os");
+const { ethers } = require("ethers");
+const http       = require("http");
+const os         = require("os");
 const { Worker, isMainThread, parentPort, workerData } = require("worker_threads");
 
 // ─────────────────────────────────────────────────────────────────────────────
 // WORKER THREAD
 // ─────────────────────────────────────────────────────────────────────────────
 if (!isMainThread) {
-  const { keccak256 } = require("ethers");
+  // ethers di-require sekali di luar loop
+  const { keccak256, solidityPackedKeccak256 } = require("ethers");
 
   const { challenge, difficultyHex, startNonce } = workerData;
-  const challengeBuf = Buffer.from(challenge.slice(2), "hex");
-  const difficulty   = BigInt("0x" + difficultyHex);
+  const diffBig = BigInt("0x" + difficultyHex);
 
-  function packAndHash(nonce) {
-    const buf = Buffer.alloc(64);
-    challengeBuf.copy(buf, 0);
-    let n = nonce;
-    for (let i = 63; i >= 32; i--) {
-      buf[i] = Number(n & 0xffn);
-      n >>= 8n;
-    }
-    return BigInt(keccak256(buf));
-  }
-
-  let nonce    = BigInt(startNonce);
-  let reported = 0n;
-  const REPORT_EVERY = 10_000n; // kirim update tiap 10k hash
+  let nonce   = BigInt(startNonce);
+  let counter = 0;
+  const REPORT = 5_000; // kirim update tiap 5k hash
 
   while (true) {
-    const hashNum = packAndHash(nonce);
+    // solidityPackedKeccak256(["bytes32","uint256"], [challenge, nonce])
+    const hash    = solidityPackedKeccak256(["bytes32", "uint256"], [challenge, nonce]);
+    const hashBig = BigInt(hash);
+    counter++;
 
-    if (hashNum < difficulty) {
-      parentPort.postMessage({ found: true, nonce: nonce.toString(), extra: Number(nonce - BigInt(startNonce) - reported) });
+    if (hashBig < diffBig) {
+      parentPort.postMessage({ found: true, nonce: nonce.toString(), count: counter });
       break;
     }
 
     nonce++;
 
-    if ((nonce - BigInt(startNonce)) % REPORT_EVERY === 0n) {
-      parentPort.postMessage({ found: false, count: Number(REPORT_EVERY) });
-      reported += REPORT_EVERY;
+    if (counter % REPORT === 0) {
+      parentPort.postMessage({ found: false, count: REPORT });
     }
   }
   process.exit(0);
@@ -52,9 +43,8 @@ if (!isMainThread) {
 // MAIN THREAD
 // ─────────────────────────────────────────────────────────────────────────────
 
-const NUM_CORES = os.cpus().length;
-
-const START_TIME    = Date.now();
+const NUM_CORES  = os.cpus().length;
+const START_TIME = Date.now();
 let totalHashes     = 0;
 let totalFound      = 0;
 let windowHashes    = 0;
@@ -90,7 +80,7 @@ http.createServer((req, res) => {
   console.log(`HTTP server listening on port ${PORT}`);
 });
 
-// Stats logger tiap 5 detik
+// Stats tiap 5 detik
 setInterval(() => {
   const now     = Date.now();
   const elapsed = (now - windowStart) / 1000;
@@ -145,18 +135,22 @@ function runWorkers(challenge, difficultyHex) {
       });
 
       w.on("message", (msg) => {
-        const count = msg.count || msg.extra || 0;
-        windowHashes += count;
-        totalHashes  += count;
+        const c = msg.count || 0;
+        windowHashes += c;
+        totalHashes  += c;
 
         if (msg.found && !resolved) {
           resolved = true;
-          workers.forEach(ww => ww.terminate());
+          workers.forEach(ww => { try { ww.terminate(); } catch(_) {} });
           resolve(msg.nonce);
         }
       });
 
-      w.on("error", reject);
+      w.on("error", (err) => {
+        console.error("Worker error:", err.message);
+        if (!resolved) reject(err);
+      });
+
       workers.push(w);
     }
   });
@@ -174,9 +168,9 @@ async function main() {
   console.log(`Cores   : ${NUM_CORES} worker threads`);
 
   while (true) {
-    const state      = await contract.miningState();
-    const difficulty = BigInt(state.difficulty.toString());
-    const challenge  = await contract.getChallenge(wallet.address);
+    const state         = await contract.miningState();
+    const difficulty    = BigInt(state.difficulty.toString());
+    const challenge     = await contract.getChallenge(wallet.address);
     const difficultyHex = difficulty.toString(16).padStart(64, "0");
 
     console.log("-------------------------------------------");
