@@ -40,7 +40,7 @@ if (!isMainThread) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 // Batasi max 4 worker agar tidak OOM/crash di Railway
-const MAX_WORKERS = Math.min(os.cpus().length, 16);
+const MAX_WORKERS = Math.min(os.cpus().length, 4);
 const START_TIME  = Date.now();
 let totalHashes     = 0;
 let totalFound      = 0;
