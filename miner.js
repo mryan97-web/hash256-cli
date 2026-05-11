@@ -1,16 +1,74 @@
 require("dotenv").config();
 
-const { ethers } = require("ethers");
-const http = require("http");
+const { ethers }  = require("ethers");
+const http        = require("http");
+const os          = require("os");
+const { Worker, isMainThread, parentPort, workerData } = require("worker_threads");
 
-// ── Stats ─────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// WORKER THREAD — hanya menjalankan hashing loop, tanpa ethers/network
+// ─────────────────────────────────────────────────────────────────────────────
+if (!isMainThread) {
+  const { createHash } = require("crypto");
+
+  const { challenge, difficultyHex, startNonce } = workerData;
+
+  // Ubah challenge bytes32 dan difficulty ke Buffer/BigInt
+  const challengeBuf = Buffer.from(challenge.slice(2), "hex"); // 32 bytes
+  const difficulty   = BigInt("0x" + difficultyHex);
+
+  // Fungsi keccak256 manual pakai ethers encode (kita pakai crypto lewat ABI encoding)
+  // Encode: abi.encodePacked(bytes32, uint256) = 32 bytes + 32 bytes = 64 bytes
+  function packAndHash(nonce) {
+    // encodePacked bytes32 + uint256
+    const buf = Buffer.alloc(64);
+    challengeBuf.copy(buf, 0);
+    // uint256 big-endian 32 bytes
+    let n = nonce;
+    for (let i = 63; i >= 32; i--) {
+      buf[i] = Number(n & 0xffn);
+      n >>= 8n;
+    }
+    // keccak256
+    const { keccak256 } = require("ethers");
+    return BigInt(keccak256(buf));
+  }
+
+  let nonce = BigInt(startNonce);
+  let count = 0;
+
+  while (true) {
+    const hashNum = packAndHash(nonce);
+    count++;
+
+    if (hashNum < difficulty) {
+      parentPort.postMessage({ found: true, nonce: nonce.toString(), count });
+      break;
+    }
+
+    nonce++;
+
+    // Kirim progress tiap 100k hash
+    if (count % 100_000 === 0) {
+      parentPort.postMessage({ found: false, count: 100_000 });
+      count = 0;
+    }
+  }
+  process.exit(0);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MAIN THREAD
+// ─────────────────────────────────────────────────────────────────────────────
+
+const NUM_CORES = os.cpus().length;
+
 const START_TIME    = Date.now();
 let totalHashes     = 0;
 let totalFound      = 0;
 let windowHashes    = 0;
 let windowStart     = Date.now();
 let currentHashrate = 0;
-// ─────────────────────────────────────────────────────────────────────────────
 
 function formatDuration(ms) {
   const s   = Math.floor(ms / 1000);
@@ -26,12 +84,12 @@ function formatHashrate(hps) {
   return hps.toFixed(0) + " H/s";
 }
 
-// ── Dummy HTTP server ─────────────────────────────────────────────────────────
+// Dummy HTTP server
 const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => {
   res.writeHead(200, { "Content-Type": "text/plain" });
   res.end(
-    `HASH256 Miner\n` +
+    `HASH256 Miner (${NUM_CORES} cores)\n` +
     `Uptime   : ${formatDuration(Date.now() - START_TIME)}\n` +
     `Hashrate : ${formatHashrate(currentHashrate)}\n` +
     `Total    : ${totalHashes.toLocaleString()} hashes\n` +
@@ -40,7 +98,24 @@ http.createServer((req, res) => {
 }).listen(PORT, () => {
   console.log(`HTTP server listening on port ${PORT}`);
 });
-// ─────────────────────────────────────────────────────────────────────────────
+
+// Stats logger tiap 10 detik
+setInterval(() => {
+  const now     = Date.now();
+  const elapsed = (now - windowStart) / 1000;
+  if (elapsed > 0) {
+    currentHashrate = windowHashes / elapsed;
+    windowHashes    = 0;
+    windowStart     = now;
+  }
+  console.log(
+    `[STATS] Hashrate: ${formatHashrate(currentHashrate)} | ` +
+    `Total: ${totalHashes.toLocaleString()} hashes | ` +
+    `Found: ${totalFound} | ` +
+    `Uptime: ${formatDuration(Date.now() - START_TIME)} | ` +
+    `Cores: ${NUM_CORES}`
+  );
+}, 10000);
 
 const RPC_URL          = process.env.RPC_URL;
 const PRIVATE_KEY      = process.env.PRIVATE_KEY;
@@ -63,56 +138,35 @@ function requireEnv() {
   }
 }
 
-function randomNonce() {
-  return BigInt(Math.floor(Math.random() * 1_000_000_000));
-}
+// Jalankan N worker, masing-masing mulai dari nonce berbeda (spaced 10B)
+function runWorkers(challenge, difficultyHex) {
+  return new Promise((resolve, reject) => {
+    const workers = [];
+    let resolved  = false;
 
-// ── Mining dalam batch kecil agar event loop tidak terblok ───────────────────
-// Setiap BATCH_SIZE hash, yield ke event loop supaya setInterval bisa jalan
-const BATCH_SIZE = 50000;
+    for (let i = 0; i < NUM_CORES; i++) {
+      const startNonce = (BigInt(Math.floor(Math.random() * 1_000_000_000)) + BigInt(i) * 10_000_000_000n).toString();
 
-function mineOneBatch(challenge, difficulty, nonce) {
-  return new Promise((resolve) => {
-    let i = 0;
-    function step() {
-      const end = Math.min(i + BATCH_SIZE, BATCH_SIZE * 1000); // max per step
-      while (i < BATCH_SIZE) {
-        const hash    = ethers.solidityPackedKeccak256(["bytes32", "uint256"], [challenge, nonce]);
-        const hashNum = BigInt(hash);
-        totalHashes++;
-        windowHashes++;
-        i++;
+      const w = new Worker(__filename, {
+        workerData: { challenge, difficultyHex, startNonce }
+      });
 
-        if (hashNum < difficulty) {
-          return resolve({ found: true, nonce, hash });
+      w.on("message", (msg) => {
+        windowHashes += msg.count || 0;
+        totalHashes  += msg.count || 0;
+
+        if (msg.found && !resolved) {
+          resolved = true;
+          // Terminate semua worker lain
+          workers.forEach(ww => ww.terminate());
+          resolve(msg.nonce);
         }
-        nonce++;
-      }
-      // Yield ke event loop, lanjut batch berikutnya
-      resolve({ found: false, nonce });
-    }
-    setImmediate(step);
-  });
-}
-// ─────────────────────────────────────────────────────────────────────────────
+      });
 
-// Print stats tiap 10 detik
-function startStatsLogger() {
-  setInterval(() => {
-    const now     = Date.now();
-    const elapsed = (now - windowStart) / 1000;
-    if (elapsed > 0) {
-      currentHashrate = windowHashes / elapsed;
-      windowHashes    = 0;
-      windowStart     = now;
+      w.on("error", reject);
+      workers.push(w);
     }
-    console.log(
-      `[STATS] Hashrate: ${formatHashrate(currentHashrate)} | ` +
-      `Total: ${totalHashes.toLocaleString()} hashes | ` +
-      `Found: ${totalFound} | ` +
-      `Uptime: ${formatDuration(Date.now() - START_TIME)}`
-    );
-  }, 10000);
+  });
 }
 
 async function main() {
@@ -122,15 +176,17 @@ async function main() {
   const wallet   = new ethers.Wallet(PRIVATE_KEY, provider);
   const contract = new ethers.Contract(CONTRACT_ADDRESS, ABI, wallet);
 
-  console.log("Wallet  :", wallet.address);
-  console.log("Contract:", CONTRACT_ADDRESS);
-
-  startStatsLogger();
+  console.log(`Wallet  : ${wallet.address}`);
+  console.log(`Contract: ${CONTRACT_ADDRESS}`);
+  console.log(`Cores   : ${NUM_CORES} worker threads`);
 
   while (true) {
     const state      = await contract.miningState();
     const difficulty = BigInt(state.difficulty.toString());
     const challenge  = await contract.getChallenge(wallet.address);
+
+    // Kirim difficulty sebagai hex string ke worker
+    const difficultyHex = difficulty.toString(16).padStart(64, "0");
 
     console.log("-------------------------------------------");
     console.log("Era       :", state.era.toString());
@@ -139,32 +195,22 @@ async function main() {
     console.log("Epoch     :", state.epoch.toString());
     console.log("Challenge :", challenge);
     console.log("-------------------------------------------");
-    console.log("Mining...");
+    console.log(`Mining dengan ${NUM_CORES} core...`);
 
-    let nonce = randomNonce();
-    let found = false;
+    const nonceFound = await runWorkers(challenge, difficultyHex);
 
-    while (!found) {
-      const result = await mineOneBatch(challenge, difficulty, nonce);
-      if (result.found) {
-        found = true;
-        totalFound++;
-        console.log("FOUND nonce :", result.nonce.toString());
-        console.log("Hash        :", result.hash);
-        console.log("Total hashes:", totalHashes.toLocaleString());
-        console.log("Hashrate    :", formatHashrate(currentHashrate));
+    totalFound++;
+    console.log("FOUND nonce :", nonceFound);
+    console.log("Total hashes:", totalHashes.toLocaleString());
+    console.log("Hashrate    :", formatHashrate(currentHashrate));
 
-        try {
-          const tx = await contract.mine(result.nonce);
-          console.log("TX sent     :", tx.hash);
-          const receipt = await tx.wait();
-          console.log("Success block:", receipt.blockNumber);
-        } catch (err) {
-          console.error("TX failed   :", err.shortMessage || err.message);
-        }
-      } else {
-        nonce = result.nonce;
-      }
+    try {
+      const tx = await contract.mine(BigInt(nonceFound));
+      console.log("TX sent     :", tx.hash);
+      const receipt = await tx.wait();
+      console.log("Success block:", receipt.blockNumber);
+    } catch (err) {
+      console.error("TX failed   :", err.shortMessage || err.message);
     }
   }
 }
