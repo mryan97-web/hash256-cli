@@ -6,52 +6,43 @@ const os          = require("os");
 const { Worker, isMainThread, parentPort, workerData } = require("worker_threads");
 
 // ─────────────────────────────────────────────────────────────────────────────
-// WORKER THREAD — hanya menjalankan hashing loop, tanpa ethers/network
+// WORKER THREAD
 // ─────────────────────────────────────────────────────────────────────────────
 if (!isMainThread) {
-  const { createHash } = require("crypto");
+  const { keccak256 } = require("ethers");
 
   const { challenge, difficultyHex, startNonce } = workerData;
-
-  // Ubah challenge bytes32 dan difficulty ke Buffer/BigInt
-  const challengeBuf = Buffer.from(challenge.slice(2), "hex"); // 32 bytes
+  const challengeBuf = Buffer.from(challenge.slice(2), "hex");
   const difficulty   = BigInt("0x" + difficultyHex);
 
-  // Fungsi keccak256 manual pakai ethers encode (kita pakai crypto lewat ABI encoding)
-  // Encode: abi.encodePacked(bytes32, uint256) = 32 bytes + 32 bytes = 64 bytes
   function packAndHash(nonce) {
-    // encodePacked bytes32 + uint256
     const buf = Buffer.alloc(64);
     challengeBuf.copy(buf, 0);
-    // uint256 big-endian 32 bytes
     let n = nonce;
     for (let i = 63; i >= 32; i--) {
       buf[i] = Number(n & 0xffn);
       n >>= 8n;
     }
-    // keccak256
-    const { keccak256 } = require("ethers");
     return BigInt(keccak256(buf));
   }
 
-  let nonce = BigInt(startNonce);
-  let count = 0;
+  let nonce    = BigInt(startNonce);
+  let reported = 0n;
+  const REPORT_EVERY = 10_000n; // kirim update tiap 10k hash
 
   while (true) {
     const hashNum = packAndHash(nonce);
-    count++;
 
     if (hashNum < difficulty) {
-      parentPort.postMessage({ found: true, nonce: nonce.toString(), count });
+      parentPort.postMessage({ found: true, nonce: nonce.toString(), extra: Number(nonce - BigInt(startNonce) - reported) });
       break;
     }
 
     nonce++;
 
-    // Kirim progress tiap 100k hash
-    if (count % 100_000 === 0) {
-      parentPort.postMessage({ found: false, count: 100_000 });
-      count = 0;
+    if ((nonce - BigInt(startNonce)) % REPORT_EVERY === 0n) {
+      parentPort.postMessage({ found: false, count: Number(REPORT_EVERY) });
+      reported += REPORT_EVERY;
     }
   }
   process.exit(0);
@@ -99,7 +90,7 @@ http.createServer((req, res) => {
   console.log(`HTTP server listening on port ${PORT}`);
 });
 
-// Stats logger tiap 10 detik
+// Stats logger tiap 5 detik
 setInterval(() => {
   const now     = Date.now();
   const elapsed = (now - windowStart) / 1000;
@@ -110,12 +101,12 @@ setInterval(() => {
   }
   console.log(
     `[STATS] Hashrate: ${formatHashrate(currentHashrate)} | ` +
-    `Total: ${totalHashes.toLocaleString()} hashes | ` +
+    `Total: ${totalHashes.toLocaleString()} | ` +
     `Found: ${totalFound} | ` +
     `Uptime: ${formatDuration(Date.now() - START_TIME)} | ` +
     `Cores: ${NUM_CORES}`
   );
-}, 10000);
+}, 5000);
 
 const RPC_URL          = process.env.RPC_URL;
 const PRIVATE_KEY      = process.env.PRIVATE_KEY;
@@ -138,26 +129,28 @@ function requireEnv() {
   }
 }
 
-// Jalankan N worker, masing-masing mulai dari nonce berbeda (spaced 10B)
 function runWorkers(challenge, difficultyHex) {
   return new Promise((resolve, reject) => {
     const workers = [];
     let resolved  = false;
 
     for (let i = 0; i < NUM_CORES; i++) {
-      const startNonce = (BigInt(Math.floor(Math.random() * 1_000_000_000)) + BigInt(i) * 10_000_000_000n).toString();
+      const startNonce = (
+        BigInt(Math.floor(Math.random() * 1_000_000_000)) +
+        BigInt(i) * 10_000_000_000n
+      ).toString();
 
       const w = new Worker(__filename, {
         workerData: { challenge, difficultyHex, startNonce }
       });
 
       w.on("message", (msg) => {
-        windowHashes += msg.count || 0;
-        totalHashes  += msg.count || 0;
+        const count = msg.count || msg.extra || 0;
+        windowHashes += count;
+        totalHashes  += count;
 
         if (msg.found && !resolved) {
           resolved = true;
-          // Terminate semua worker lain
           workers.forEach(ww => ww.terminate());
           resolve(msg.nonce);
         }
@@ -184,8 +177,6 @@ async function main() {
     const state      = await contract.miningState();
     const difficulty = BigInt(state.difficulty.toString());
     const challenge  = await contract.getChallenge(wallet.address);
-
-    // Kirim difficulty sebagai hex string ke worker
     const difficultyHex = difficulty.toString(16).padStart(64, "0");
 
     console.log("-------------------------------------------");
