@@ -80,7 +80,7 @@ function printStats() {
 
   const uptime = formatDuration(now - START_TIME);
   process.stdout.write(
-    `\r⛏  Hashrate: ${formatHashrate(currentHashrate).padEnd(12)} | ` +
+    `\⛏  Hashrate: ${formatHashrate(currentHashrate).padEnd(12)} | ` +
     `Total: ${totalHashes.toLocaleString().padEnd(14)} | ` +
     `Found: ${totalFound} | ` +
     `Uptime: ${uptime}   `
